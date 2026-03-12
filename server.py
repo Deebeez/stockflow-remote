@@ -18,7 +18,8 @@ import pandas as pd
 import numpy as np
 from mcp.server.fastmcp import FastMCP
 
-# --- JSON Encoder for financial data types ---
+
+# --- JSON helpers ---
 class StockflowJSONEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, (pd.Timestamp, datetime.date, datetime.datetime)):
@@ -28,9 +29,7 @@ class StockflowJSONEncoder(json.JSONEncoder):
         if isinstance(obj, (np.integer,)):
             return int(obj)
         if isinstance(obj, (np.floating,)):
-            if np.isnan(obj):
-                return None
-            return float(obj)
+            return None if np.isnan(obj) else float(obj)
         if isinstance(obj, np.ndarray):
             return obj.tolist()
         if pd.isna(obj):
@@ -229,7 +228,6 @@ def get_historical_data(
             return safe_json({"error": f"No historical data found for {symbol}"})
 
         close = hist["Close"]
-
         hist["SMA_20"] = close.rolling(window=20).mean()
         hist["SMA_50"] = close.rolling(window=50).mean()
         hist["SMA_200"] = close.rolling(window=200).mean()
@@ -253,7 +251,7 @@ def get_historical_data(
 
         records = []
         for idx, row in hist.iterrows():
-            record = {
+            records.append({
                 "date": idx.isoformat() if isinstance(idx, pd.Timestamp) else str(idx),
                 "open": clean_value(row.get("Open")),
                 "high": clean_value(row.get("High")),
@@ -270,21 +268,18 @@ def get_historical_data(
                 "bb_upper": clean_value(row.get("BB_Upper")),
                 "bb_middle": clean_value(row.get("BB_Middle")),
                 "bb_lower": clean_value(row.get("BB_Lower")),
-            }
-            records.append(record)
+            })
 
         latest = records[-1] if records else {}
 
-        result = {
+        return safe_json({
             "symbol": symbol.upper(),
             "period": period,
             "interval": interval,
             "total_records": len(records),
             "latest": latest,
             "data": records,
-        }
-
-        return safe_json(result)
+        })
 
     except Exception as e:
         return safe_json({"error": str(e), "traceback": traceback.format_exc()})
@@ -369,19 +364,42 @@ def get_options_chain(
         return safe_json({"error": str(e), "traceback": traceback.format_exc()})
 
 
-# --- Run the server with CORS support for claude.ai ---
+# --- Run the server ---
+# The MCP SDK's transport_security rejects requests where the Host header
+# doesn't match localhost. On Railway (or any cloud host), the Host header
+# is the public domain. This middleware rewrites it so the MCP handler accepts it.
+
+class HostFixMiddleware:
+    """Rewrites the Host header to localhost so MCP transport security accepts
+    requests from cloud reverse proxies like Railway."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            scope = dict(scope)
+            new_headers = []
+            for key, value in scope.get("headers", []):
+                if key == b"host":
+                    port = os.environ.get("PORT", "8000")
+                    value = f"localhost:{port}".encode()
+                new_headers.append((key, value))
+            scope["headers"] = new_headers
+        await self.app(scope, receive, send)
+
+
 if __name__ == "__main__":
     import uvicorn
     from starlette.middleware.cors import CORSMiddleware
-    from starlette.applications import Starlette
 
     port = int(os.environ.get("PORT", 8000))
 
-    # Get the MCP ASGI app
-    mcp_app = mcp.streamable_http_app()
+    # Build the MCP ASGI app
+    app = mcp.streamable_http_app()
 
-    # Wrap with CORS middleware so claude.ai can connect
-    mcp_app.add_middleware(
+    # Add CORS so claude.ai browser can connect
+    app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
         allow_credentials=True,
@@ -390,4 +408,7 @@ if __name__ == "__main__":
         expose_headers=["*"],
     )
 
-    uvicorn.run(mcp_app, host="0.0.0.0", port=port)
+    # Wrap with host fix (outermost layer, runs first)
+    wrapped_app = HostFixMiddleware(app)
+
+    uvicorn.run(wrapped_app, host="0.0.0.0", port=port)
