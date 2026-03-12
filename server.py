@@ -42,12 +42,10 @@ class StockflowJSONEncoder(json.JSONEncoder):
 
 
 def safe_json(data: dict) -> str:
-    """Safely serialize financial data to JSON string."""
     return json.dumps(data, cls=StockflowJSONEncoder, indent=2)
 
 
 def clean_value(val):
-    """Clean a single value for JSON serialization."""
     if val is None:
         return None
     if isinstance(val, (pd.Timestamp, datetime.date, datetime.datetime)):
@@ -59,12 +57,11 @@ def clean_value(val):
     if isinstance(val, (np.floating,)):
         return None if np.isnan(val) else float(val)
     if isinstance(val, float):
-        return None if (val != val) else val  # NaN check
+        return None if (val != val) else val
     return val
 
 
 def clean_dict(d: dict) -> dict:
-    """Recursively clean a dictionary for JSON serialization."""
     cleaned = {}
     for k, v in d.items():
         key = k.isoformat() if isinstance(k, (pd.Timestamp, datetime.date)) else str(k)
@@ -217,7 +214,7 @@ def get_historical_data(
     interval: str = "1d",
 ) -> str:
     """Get historical price data with OHLC values and volume, plus technical indicators
-    (SMA 20/50/200, RSI 14, MACD).
+    (SMA 20/50/200, RSI 14, MACD, Bollinger Bands).
 
     Args:
         symbol: Stock ticker symbol (e.g. AAPL, CEG, TLN)
@@ -231,35 +228,29 @@ def get_historical_data(
         if hist.empty:
             return safe_json({"error": f"No historical data found for {symbol}"})
 
-        # Calculate technical indicators
         close = hist["Close"]
 
-        # Simple Moving Averages
         hist["SMA_20"] = close.rolling(window=20).mean()
         hist["SMA_50"] = close.rolling(window=50).mean()
         hist["SMA_200"] = close.rolling(window=200).mean()
 
-        # RSI (14-period)
         delta = close.diff()
         gain = delta.where(delta > 0, 0.0).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0.0)).rolling(window=14).mean()
         rs = gain / loss
         hist["RSI_14"] = 100 - (100 / (1 + rs))
 
-        # MACD
         ema_12 = close.ewm(span=12, adjust=False).mean()
         ema_26 = close.ewm(span=26, adjust=False).mean()
         hist["MACD"] = ema_12 - ema_26
         hist["MACD_Signal"] = hist["MACD"].ewm(span=9, adjust=False).mean()
         hist["MACD_Histogram"] = hist["MACD"] - hist["MACD_Signal"]
 
-        # Bollinger Bands
         hist["BB_Middle"] = hist["SMA_20"]
         bb_std = close.rolling(window=20).std()
         hist["BB_Upper"] = hist["BB_Middle"] + (bb_std * 2)
         hist["BB_Lower"] = hist["BB_Middle"] - (bb_std * 2)
 
-        # Convert to records
         records = []
         for idx, row in hist.iterrows():
             record = {
@@ -282,7 +273,6 @@ def get_historical_data(
             }
             records.append(record)
 
-        # Latest snapshot for quick reference
         latest = records[-1] if records else {}
 
         result = {
@@ -311,18 +301,16 @@ def get_options_chain(
 
     Args:
         symbol: Stock ticker symbol (e.g. AAPL, CEG)
-        expiration_date: Options expiration date in YYYY-MM-DD format. Leave empty to get nearest expiration.
+        expiration_date: Options expiration date in YYYY-MM-DD format. Leave empty for nearest expiration.
         include_greeks: Include delta, gamma, theta, vega if available
     """
     try:
         ticker = yf.Ticker(symbol.upper())
 
-        # Get available expiration dates
         expirations = ticker.options
         if not expirations:
             return safe_json({"error": f"No options data available for {symbol}"})
 
-        # Use provided date or nearest
         if expiration_date and expiration_date in expirations:
             exp = expiration_date
         else:
@@ -361,7 +349,6 @@ def get_options_chain(
         calls = process_options(chain.calls, "call")
         puts = process_options(chain.puts, "put")
 
-        # Get current price for context
         info = ticker.info
         current_price = info.get("currentPrice") or info.get("regularMarketPrice")
 
@@ -382,10 +369,25 @@ def get_options_chain(
         return safe_json({"error": str(e), "traceback": traceback.format_exc()})
 
 
-# --- Run the server with uvicorn for proper host/port control ---
+# --- Run the server with CORS support for claude.ai ---
 if __name__ == "__main__":
     import uvicorn
+    from starlette.middleware.cors import CORSMiddleware
+    from starlette.applications import Starlette
 
     port = int(os.environ.get("PORT", 8000))
-    app = mcp.streamable_http_app()
-    uvicorn.run(app, host="0.0.0.0", port=port)
+
+    # Get the MCP ASGI app
+    mcp_app = mcp.streamable_http_app()
+
+    # Wrap with CORS middleware so claude.ai can connect
+    mcp_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["*"],
+    )
+
+    uvicorn.run(mcp_app, host="0.0.0.0", port=port)
