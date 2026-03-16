@@ -5,9 +5,6 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from mcp.server.fastmcp import FastMCP
-from starlette.applications import Starlette
-from starlette.routing import Mount
-from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 
 mcp = FastMCP("Stockflow")
@@ -19,15 +16,16 @@ mcp = FastMCP("Stockflow")
 def compute_rsi_wilder(closes: pd.Series, period: int = 14) -> pd.Series:
     """
     Compute RSI using Wilder's smoothing method (same as TradingView).
-    Uses exponential moving average with alpha = 1/period, seeded by SMA.
+    Uses exponential moving average with alpha = 1/period.
+    Requires full price history for proper warm-up.
     """
     delta = closes.diff()
     gain = delta.where(delta > 0, 0.0)
     loss = (-delta).where(delta < 0, 0.0)
-    
+
     avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    
+
     rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
     return rsi
@@ -40,28 +38,28 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     Expects the FULL price history for proper warm-up.
     """
     close = df['Close']
-    
+
     # SMA
     df['sma_20'] = close.rolling(window=20).mean()
     df['sma_50'] = close.rolling(window=50).mean()
     df['sma_200'] = close.rolling(window=200).mean()
-    
+
     # RSI - Wilder's smoothing method (matches TradingView)
     df['rsi_14'] = compute_rsi_wilder(close, 14)
-    
+
     # MACD (12, 26, 9) - standard EMA
     ema_12 = close.ewm(span=12, adjust=False).mean()
     ema_26 = close.ewm(span=26, adjust=False).mean()
     df['macd'] = ema_12 - ema_26
     df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
     df['macd_histogram'] = df['macd'] - df['macd_signal']
-    
+
     # Bollinger Bands (20, 2)
     df['bb_middle'] = df['sma_20']
     bb_std = close.rolling(window=20).std()
     df['bb_upper'] = df['bb_middle'] + (bb_std * 2)
     df['bb_lower'] = df['bb_middle'] - (bb_std * 2)
-    
+
     return df
 
 
@@ -205,7 +203,7 @@ def get_historical_data(
 ) -> str:
     """Get historical price data with OHLC values and volume, plus technical indicators
     (SMA 20/50/200, RSI 14, MACD, Bollinger Bands).
-    
+
     RSI uses Wilder's smoothing method (matches TradingView) with full history warm-up.
 
     Args:
@@ -215,38 +213,38 @@ def get_historical_data(
     """
     try:
         ticker = yf.Ticker(symbol)
-        
-        # For daily/weekly/monthly intervals, always fetch max history 
+
+        # For daily/weekly/monthly intervals, always fetch max history
         # for indicator warm-up, then trim to requested period.
         # For intraday intervals, use the requested period directly
         # (Yahoo limits intraday history anyway).
         warmup_intervals = {'1d', '5d', '1wk', '1mo', '3mo'}
         needs_warmup = interval in warmup_intervals and period != 'max'
-        
+
         if needs_warmup:
-            # Fetch full history for warm-up
+            # Fetch full history for indicator warm-up
             df_full = ticker.history(period='max', interval=interval)
             if df_full.empty:
                 return json.dumps({"error": f"No data found for {symbol}"})
-            
-            # Also fetch the requested period to know the date cutoff
+
+            # Fetch requested period to get the start date cutoff
             df_requested = ticker.history(period=period, interval=interval)
             if df_requested.empty:
                 return json.dumps({"error": f"No data for period {period}"})
-            
-            # Compute indicators on full history
+
+            # Compute indicators on full history (proper warm-up)
             df_full = compute_indicators(df_full)
-            
-            # Trim to requested period (match the start date of the requested data)
+
+            # Trim to requested period
             start_date = df_requested.index[0]
             df = df_full[df_full.index >= start_date].copy()
         else:
-            # Fetch directly (intraday or max period)
+            # Intraday or max period — fetch and compute directly
             df = ticker.history(period=period, interval=interval)
             if df.empty:
                 return json.dumps({"error": f"No data found for {symbol}"})
             df = compute_indicators(df)
-        
+
         # Format output
         records = []
         for idx, row in df.iterrows():
@@ -364,19 +362,22 @@ def get_options_chain(
 
 
 # ============================================================
-# STARLETTE APP WITH CORS
+# APP SETUP
 # ============================================================
 
-app = Starlette(
-    routes=[Mount("/mcp", app=mcp.streamable_http_app())],
-    middleware=[
-        Middleware(
-            CORSMiddleware,
-            allow_origins=["*"],
-            allow_methods=["*"],
-            allow_headers=["*"],
-        )
-    ],
+# streamable_http_app() returns a complete Starlette app with:
+#   - /mcp route (Streamable HTTP endpoint)
+#   - lifespan handler (initializes session manager task group)
+# Do NOT wrap in another Starlette() or use Mount() — that breaks the lifespan.
+# Add CORS middleware directly to this app.
+
+app = mcp.streamable_http_app()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=True,
 )
 
 if __name__ == "__main__":
