@@ -368,7 +368,7 @@ def get_options_chain(
 # ============================================================
 
 app = Starlette(
-    routes=[Mount("/mcp", app=mcp.sse_app())],
+    routes=[Mount("/mcp", app=mcp.streamable_http_app())],
     middleware=[
         Middleware(
             CORSMiddleware,
@@ -380,5 +380,5 @@ app = Starlette(
 )
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.environ.get("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)
