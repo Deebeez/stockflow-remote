@@ -1,92 +1,80 @@
-"""
-StockFlow Remote MCP Server
-----------------------------
-A remote MCP server that provides real-time stock data via Yahoo Finance.
-Designed to connect to claude.ai web via Custom Connectors.
-
-Based on twolven/mcp-stockflow (MIT License).
-Converted from stdio to Streamable HTTP transport for cloud deployment.
-"""
-
-import os
 import json
-import datetime
-import traceback
-
+import os
+import uvicorn
 import yfinance as yf
 import pandas as pd
 import numpy as np
 from mcp.server.fastmcp import FastMCP
+from starlette.applications import Starlette
+from starlette.routing import Mount
+from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
+
+mcp = FastMCP("Stockflow")
+
+# ============================================================
+# TECHNICAL INDICATOR HELPERS
+# ============================================================
+
+def compute_rsi_wilder(closes: pd.Series, period: int = 14) -> pd.Series:
+    """
+    Compute RSI using Wilder's smoothing method (same as TradingView).
+    Uses exponential moving average with alpha = 1/period, seeded by SMA.
+    """
+    delta = closes.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = (-delta).where(delta < 0, 0.0)
+    
+    avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
 
 
-# --- JSON helpers ---
-class StockflowJSONEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, (pd.Timestamp, datetime.date, datetime.datetime)):
-            return obj.isoformat()
-        if isinstance(obj, pd.Period):
-            return str(obj)
-        if isinstance(obj, (np.integer,)):
-            return int(obj)
-        if isinstance(obj, (np.floating,)):
-            return None if np.isnan(obj) else float(obj)
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        if pd.isna(obj):
-            return None
-        try:
-            return super().default(obj)
-        except TypeError:
-            return str(obj)
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute all technical indicators on a DataFrame with 'Close' column.
+    Uses Wilder smoothing for RSI and standard EMA for MACD.
+    Expects the FULL price history for proper warm-up.
+    """
+    close = df['Close']
+    
+    # SMA
+    df['sma_20'] = close.rolling(window=20).mean()
+    df['sma_50'] = close.rolling(window=50).mean()
+    df['sma_200'] = close.rolling(window=200).mean()
+    
+    # RSI - Wilder's smoothing method (matches TradingView)
+    df['rsi_14'] = compute_rsi_wilder(close, 14)
+    
+    # MACD (12, 26, 9) - standard EMA
+    ema_12 = close.ewm(span=12, adjust=False).mean()
+    ema_26 = close.ewm(span=26, adjust=False).mean()
+    df['macd'] = ema_12 - ema_26
+    df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+    df['macd_histogram'] = df['macd'] - df['macd_signal']
+    
+    # Bollinger Bands (20, 2)
+    df['bb_middle'] = df['sma_20']
+    bb_std = close.rolling(window=20).std()
+    df['bb_upper'] = df['bb_middle'] + (bb_std * 2)
+    df['bb_lower'] = df['bb_middle'] - (bb_std * 2)
+    
+    return df
 
 
-def safe_json(data: dict) -> str:
-    return json.dumps(data, cls=StockflowJSONEncoder, indent=2)
-
-
-def clean_value(val):
-    if val is None:
-        return None
-    if isinstance(val, (pd.Timestamp, datetime.date, datetime.datetime)):
-        return val.isoformat()
-    if isinstance(val, pd.Period):
-        return str(val)
-    if isinstance(val, (np.integer,)):
-        return int(val)
-    if isinstance(val, (np.floating,)):
-        return None if np.isnan(val) else float(val)
-    if isinstance(val, float):
-        return None if (val != val) else val
-    return val
-
-
-def clean_dict(d: dict) -> dict:
-    cleaned = {}
-    for k, v in d.items():
-        key = k.isoformat() if isinstance(k, (pd.Timestamp, datetime.date)) else str(k)
-        if isinstance(v, dict):
-            cleaned[key] = clean_dict(v)
-        elif isinstance(v, list):
-            cleaned[key] = [clean_value(item) for item in v]
-        else:
-            cleaned[key] = clean_value(v)
-    return cleaned
-
-
-# --- Create MCP Server ---
-mcp = FastMCP(
-    "StockFlow",
-    stateless_http=True,
-    json_response=True,
-)
-
+# ============================================================
+# MCP TOOLS
+# ============================================================
 
 @mcp.tool()
 def get_stock_data(
     symbol: str,
     include_financials: bool = False,
     include_analysis: bool = False,
-    include_calendar: bool = False,
+    include_calendar: bool = False
 ) -> str:
     """Get comprehensive stock data including price, volume, market cap, P/E ratio,
     52-week high/low, and optionally financials, analyst ratings, and calendar events.
@@ -98,23 +86,23 @@ def get_stock_data(
         include_calendar: Include upcoming earnings and dividend dates
     """
     try:
-        ticker = yf.Ticker(symbol.upper())
+        ticker = yf.Ticker(symbol)
         info = ticker.info
 
         result = {
             "symbol": symbol.upper(),
-            "name": info.get("longName") or info.get("shortName", "N/A"),
+            "name": info.get("longName", ""),
             "price": {
                 "current": info.get("currentPrice") or info.get("regularMarketPrice"),
-                "open": info.get("regularMarketOpen"),
-                "high": info.get("regularMarketDayHigh"),
-                "low": info.get("regularMarketDayLow"),
-                "previous_close": info.get("regularMarketPreviousClose"),
+                "open": info.get("open") or info.get("regularMarketOpen"),
+                "high": info.get("dayHigh") or info.get("regularMarketDayHigh"),
+                "low": info.get("dayLow") or info.get("regularMarketDayLow"),
+                "previous_close": info.get("previousClose") or info.get("regularMarketPreviousClose"),
                 "change": info.get("regularMarketChange"),
                 "change_percent": info.get("regularMarketChangePercent"),
             },
             "volume": {
-                "current": info.get("regularMarketVolume"),
+                "current": info.get("volume") or info.get("regularMarketVolume"),
                 "average": info.get("averageVolume"),
                 "average_10d": info.get("averageDailyVolume10Day"),
             },
@@ -147,73 +135,78 @@ def get_stock_data(
                 "ex_dividend_date": info.get("exDividendDate"),
                 "payout_ratio": info.get("payoutRatio"),
             },
-            "financials_summary": {
-                "revenue": info.get("totalRevenue"),
-                "revenue_per_share": info.get("revenuePerShare"),
-                "profit_margins": info.get("profitMargins"),
-                "operating_margins": info.get("operatingMargins"),
-                "return_on_equity": info.get("returnOnEquity"),
-                "return_on_assets": info.get("returnOnAssets"),
-                "earnings_per_share": info.get("trailingEps"),
-                "forward_eps": info.get("forwardEps"),
-                "total_cash": info.get("totalCash"),
-                "total_debt": info.get("totalDebt"),
-                "debt_to_equity": info.get("debtToEquity"),
-                "free_cash_flow": info.get("freeCashflow"),
-                "operating_cash_flow": info.get("operatingCashflow"),
-            },
-            "target": {
+        }
+
+        if include_financials:
+            quarterly = ticker.quarterly_income_stmt
+            if quarterly is not None and not quarterly.empty:
+                result["financials_summary"] = {
+                    "revenue": info.get("totalRevenue"),
+                    "revenue_per_share": info.get("revenuePerShare"),
+                    "profit_margins": info.get("profitMargins"),
+                    "operating_margins": info.get("operatingMargins"),
+                    "return_on_equity": info.get("returnOnEquity"),
+                    "return_on_assets": info.get("returnOnAssets"),
+                    "earnings_per_share": info.get("trailingEps"),
+                    "forward_eps": info.get("forwardEps"),
+                    "total_cash": info.get("totalCash"),
+                    "total_debt": info.get("totalDebt"),
+                    "debt_to_equity": info.get("debtToEquity"),
+                    "free_cash_flow": info.get("freeCashflow"),
+                    "operating_cash_flow": info.get("operatingCashflow"),
+                }
+                result["quarterly_financials"] = {}
+                for col in quarterly.columns:
+                    col_data = quarterly[col].to_dict()
+                    result["quarterly_financials"][str(col)] = {
+                        str(k): (float(v) if pd.notna(v) else None)
+                        for k, v in col_data.items()
+                    }
+
+        if include_analysis:
+            result["target"] = {
                 "target_high": info.get("targetHighPrice"),
                 "target_low": info.get("targetLowPrice"),
                 "target_mean": info.get("targetMeanPrice"),
                 "target_median": info.get("targetMedianPrice"),
                 "recommendation": info.get("recommendationKey"),
                 "number_of_analysts": info.get("numberOfAnalystOpinions"),
-            },
-        }
-
-        if include_financials:
-            try:
-                quarterly = ticker.quarterly_financials
-                if quarterly is not None and not quarterly.empty:
-                    result["quarterly_financials"] = clean_dict(quarterly.to_dict())
-            except Exception:
-                result["quarterly_financials"] = "unavailable"
-
-        if include_analysis:
-            try:
-                recs = ticker.recommendations
-                if recs is not None and not recs.empty:
-                    recent = recs.tail(10)
-                    result["recent_recommendations"] = clean_dict(recent.to_dict())
-            except Exception:
-                result["recent_recommendations"] = "unavailable"
+            }
+            recs = ticker.recommendations
+            if recs is not None and not recs.empty:
+                recent = recs.tail(4)
+                result["recent_recommendations"] = recent.to_dict()
 
         if include_calendar:
             try:
                 cal = ticker.calendar
                 if cal is not None:
-                    if isinstance(cal, pd.DataFrame):
-                        result["calendar"] = clean_dict(cal.to_dict())
-                    elif isinstance(cal, dict):
-                        result["calendar"] = clean_dict(cal)
+                    if isinstance(cal, dict):
+                        result["calendar"] = {
+                            k: (v if not isinstance(v, pd.Timestamp) else str(v))
+                            for k, v in cal.items()
+                        }
+                    elif isinstance(cal, pd.DataFrame):
+                        result["calendar"] = cal.to_dict()
             except Exception:
-                result["calendar"] = "unavailable"
+                result["calendar"] = None
 
-        return safe_json(clean_dict(result))
+        return json.dumps(result, default=str)
 
     except Exception as e:
-        return safe_json({"error": str(e), "traceback": traceback.format_exc()})
+        return json.dumps({"error": str(e)})
 
 
 @mcp.tool()
 def get_historical_data(
     symbol: str,
     period: str = "1y",
-    interval: str = "1d",
+    interval: str = "1d"
 ) -> str:
     """Get historical price data with OHLC values and volume, plus technical indicators
     (SMA 20/50/200, RSI 14, MACD, Bollinger Bands).
+    
+    RSI uses Wilder's smoothing method (matches TradingView) with full history warm-up.
 
     Args:
         symbol: Stock ticker symbol (e.g. AAPL, CEG, TLN)
@@ -221,75 +214,82 @@ def get_historical_data(
         interval: Data interval - 1m, 2m, 5m, 15m, 30m, 60m, 90m, 1h, 1d, 5d, 1wk, 1mo, 3mo
     """
     try:
-        ticker = yf.Ticker(symbol.upper())
-        hist = ticker.history(period=period, interval=interval)
-
-        if hist.empty:
-            return safe_json({"error": f"No historical data found for {symbol}"})
-
-        close = hist["Close"]
-        hist["SMA_20"] = close.rolling(window=20).mean()
-        hist["SMA_50"] = close.rolling(window=50).mean()
-        hist["SMA_200"] = close.rolling(window=200).mean()
-
-        delta = close.diff()
-        gain = delta.where(delta > 0, 0.0).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0.0)).rolling(window=14).mean()
-        rs = gain / loss
-        hist["RSI_14"] = 100 - (100 / (1 + rs))
-
-        ema_12 = close.ewm(span=12, adjust=False).mean()
-        ema_26 = close.ewm(span=26, adjust=False).mean()
-        hist["MACD"] = ema_12 - ema_26
-        hist["MACD_Signal"] = hist["MACD"].ewm(span=9, adjust=False).mean()
-        hist["MACD_Histogram"] = hist["MACD"] - hist["MACD_Signal"]
-
-        hist["BB_Middle"] = hist["SMA_20"]
-        bb_std = close.rolling(window=20).std()
-        hist["BB_Upper"] = hist["BB_Middle"] + (bb_std * 2)
-        hist["BB_Lower"] = hist["BB_Middle"] - (bb_std * 2)
-
+        ticker = yf.Ticker(symbol)
+        
+        # For daily/weekly/monthly intervals, always fetch max history 
+        # for indicator warm-up, then trim to requested period.
+        # For intraday intervals, use the requested period directly
+        # (Yahoo limits intraday history anyway).
+        warmup_intervals = {'1d', '5d', '1wk', '1mo', '3mo'}
+        needs_warmup = interval in warmup_intervals and period != 'max'
+        
+        if needs_warmup:
+            # Fetch full history for warm-up
+            df_full = ticker.history(period='max', interval=interval)
+            if df_full.empty:
+                return json.dumps({"error": f"No data found for {symbol}"})
+            
+            # Also fetch the requested period to know the date cutoff
+            df_requested = ticker.history(period=period, interval=interval)
+            if df_requested.empty:
+                return json.dumps({"error": f"No data for period {period}"})
+            
+            # Compute indicators on full history
+            df_full = compute_indicators(df_full)
+            
+            # Trim to requested period (match the start date of the requested data)
+            start_date = df_requested.index[0]
+            df = df_full[df_full.index >= start_date].copy()
+        else:
+            # Fetch directly (intraday or max period)
+            df = ticker.history(period=period, interval=interval)
+            if df.empty:
+                return json.dumps({"error": f"No data found for {symbol}"})
+            df = compute_indicators(df)
+        
+        # Format output
         records = []
-        for idx, row in hist.iterrows():
+        for idx, row in df.iterrows():
             records.append({
-                "date": idx.isoformat() if isinstance(idx, pd.Timestamp) else str(idx),
-                "open": clean_value(row.get("Open")),
-                "high": clean_value(row.get("High")),
-                "low": clean_value(row.get("Low")),
-                "close": clean_value(row.get("Close")),
-                "volume": clean_value(row.get("Volume")),
-                "sma_20": clean_value(row.get("SMA_20")),
-                "sma_50": clean_value(row.get("SMA_50")),
-                "sma_200": clean_value(row.get("SMA_200")),
-                "rsi_14": clean_value(row.get("RSI_14")),
-                "macd": clean_value(row.get("MACD")),
-                "macd_signal": clean_value(row.get("MACD_Signal")),
-                "macd_histogram": clean_value(row.get("MACD_Histogram")),
-                "bb_upper": clean_value(row.get("BB_Upper")),
-                "bb_middle": clean_value(row.get("BB_Middle")),
-                "bb_lower": clean_value(row.get("BB_Lower")),
+                "date": str(idx),
+                "open": float(row["Open"]) if pd.notna(row.get("Open")) else None,
+                "high": float(row["High"]) if pd.notna(row.get("High")) else None,
+                "low": float(row["Low"]) if pd.notna(row.get("Low")) else None,
+                "close": float(row["Close"]) if pd.notna(row.get("Close")) else None,
+                "volume": float(row["Volume"]) if pd.notna(row.get("Volume")) else None,
+                "sma_20": float(row["sma_20"]) if pd.notna(row.get("sma_20")) else None,
+                "sma_50": float(row["sma_50"]) if pd.notna(row.get("sma_50")) else None,
+                "sma_200": float(row["sma_200"]) if pd.notna(row.get("sma_200")) else None,
+                "rsi_14": float(row["rsi_14"]) if pd.notna(row.get("rsi_14")) else None,
+                "macd": float(row["macd"]) if pd.notna(row.get("macd")) else None,
+                "macd_signal": float(row["macd_signal"]) if pd.notna(row.get("macd_signal")) else None,
+                "macd_histogram": float(row["macd_histogram"]) if pd.notna(row.get("macd_histogram")) else None,
+                "bb_upper": float(row["bb_upper"]) if pd.notna(row.get("bb_upper")) else None,
+                "bb_middle": float(row["bb_middle"]) if pd.notna(row.get("bb_middle")) else None,
+                "bb_lower": float(row["bb_lower"]) if pd.notna(row.get("bb_lower")) else None,
             })
 
         latest = records[-1] if records else {}
 
-        return safe_json({
+        return json.dumps({
             "symbol": symbol.upper(),
             "period": period,
             "interval": interval,
             "total_records": len(records),
+            "indicator_note": "RSI uses Wilder smoothing with full history warm-up (matches TradingView)",
             "latest": latest,
             "data": records,
-        })
+        }, default=str)
 
     except Exception as e:
-        return safe_json({"error": str(e), "traceback": traceback.format_exc()})
+        return json.dumps({"error": str(e)})
 
 
 @mcp.tool()
 def get_options_chain(
     symbol: str,
     expiration_date: str = "",
-    include_greeks: bool = True,
+    include_greeks: bool = True
 ) -> str:
     """Get options chain data including calls and puts with strike prices, bid/ask,
     volume, open interest, implied volatility, and optionally Greeks.
@@ -300,54 +300,55 @@ def get_options_chain(
         include_greeks: Include delta, gamma, theta, vega if available
     """
     try:
-        ticker = yf.Ticker(symbol.upper())
+        ticker = yf.Ticker(symbol)
+        info = ticker.info
+        current_price = info.get("currentPrice") or info.get("regularMarketPrice")
 
         expirations = ticker.options
         if not expirations:
-            return safe_json({"error": f"No options data available for {symbol}"})
+            return json.dumps({"error": f"No options data available for {symbol}"})
 
         if expiration_date and expiration_date in expirations:
             exp = expiration_date
+        elif expiration_date:
+            exp = min(expirations, key=lambda x: abs(pd.Timestamp(x) - pd.Timestamp(expiration_date)))
         else:
             exp = expirations[0]
 
         chain = ticker.option_chain(exp)
 
-        def process_options(df, option_type):
+        def format_options(df, option_type):
             options = []
             for _, row in df.iterrows():
                 opt = {
                     "type": option_type,
-                    "strike": clean_value(row.get("strike")),
-                    "last_price": clean_value(row.get("lastPrice")),
-                    "bid": clean_value(row.get("bid")),
-                    "ask": clean_value(row.get("ask")),
-                    "change": clean_value(row.get("change")),
-                    "percent_change": clean_value(row.get("percentChange")),
-                    "volume": clean_value(row.get("volume")),
-                    "open_interest": clean_value(row.get("openInterest")),
-                    "implied_volatility": clean_value(row.get("impliedVolatility")),
-                    "in_the_money": bool(row.get("inTheMoney", False)),
+                    "strike": float(row["strike"]),
+                    "last_price": float(row["lastPrice"]) if pd.notna(row.get("lastPrice")) else None,
+                    "bid": float(row["bid"]) if pd.notna(row.get("bid")) else None,
+                    "ask": float(row["ask"]) if pd.notna(row.get("ask")) else None,
+                    "change": float(row["change"]) if pd.notna(row.get("change")) else None,
+                    "percent_change": float(row["percentChange"]) if pd.notna(row.get("percentChange")) else None,
+                    "volume": float(row["volume"]) if pd.notna(row.get("volume")) else None,
+                    "open_interest": float(row["openInterest"]) if pd.notna(row.get("openInterest")) else None,
+                    "implied_volatility": float(row["impliedVolatility"]) if pd.notna(row.get("impliedVolatility")) else None,
+                    "in_the_money": bool(row["inTheMoney"]) if pd.notna(row.get("inTheMoney")) else None,
                     "contract_symbol": str(row.get("contractSymbol", "")),
                 }
                 if include_greeks:
                     opt["greeks"] = {
-                        "delta": clean_value(row.get("delta")),
-                        "gamma": clean_value(row.get("gamma")),
-                        "theta": clean_value(row.get("theta")),
-                        "vega": clean_value(row.get("vega")),
-                        "rho": clean_value(row.get("rho")),
+                        "delta": float(row["delta"]) if pd.notna(row.get("delta")) else None,
+                        "gamma": float(row["gamma"]) if pd.notna(row.get("gamma")) else None,
+                        "theta": float(row["theta"]) if pd.notna(row.get("theta")) else None,
+                        "vega": float(row["vega"]) if pd.notna(row.get("vega")) else None,
+                        "rho": float(row["rho"]) if pd.notna(row.get("rho")) else None,
                     }
                 options.append(opt)
             return options
 
-        calls = process_options(chain.calls, "call")
-        puts = process_options(chain.puts, "put")
+        calls = format_options(chain.calls, "call")
+        puts = format_options(chain.puts, "put")
 
-        info = ticker.info
-        current_price = info.get("currentPrice") or info.get("regularMarketPrice")
-
-        result = {
+        return json.dumps({
             "symbol": symbol.upper(),
             "current_price": current_price,
             "expiration_date": exp,
@@ -356,59 +357,28 @@ def get_options_chain(
             "puts_count": len(puts),
             "calls": calls,
             "puts": puts,
-        }
-
-        return safe_json(clean_dict(result))
+        }, default=str)
 
     except Exception as e:
-        return safe_json({"error": str(e), "traceback": traceback.format_exc()})
+        return json.dumps({"error": str(e)})
 
 
-# --- Run the server ---
-# The MCP SDK's transport_security rejects requests where the Host header
-# doesn't match localhost. On Railway (or any cloud host), the Host header
-# is the public domain. This middleware rewrites it so the MCP handler accepts it.
+# ============================================================
+# STARLETTE APP WITH CORS
+# ============================================================
 
-class HostFixMiddleware:
-    """Rewrites the Host header to localhost so MCP transport security accepts
-    requests from cloud reverse proxies like Railway."""
-
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] == "http":
-            scope = dict(scope)
-            new_headers = []
-            for key, value in scope.get("headers", []):
-                if key == b"host":
-                    port = os.environ.get("PORT", "8000")
-                    value = f"localhost:{port}".encode()
-                new_headers.append((key, value))
-            scope["headers"] = new_headers
-        await self.app(scope, receive, send)
-
+app = Starlette(
+    routes=[Mount("/mcp", app=mcp.sse_app())],
+    middleware=[
+        Middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+    ],
+)
 
 if __name__ == "__main__":
-    import uvicorn
-    from starlette.middleware.cors import CORSMiddleware
-
     port = int(os.environ.get("PORT", 8000))
-
-    # Build the MCP ASGI app
-    app = mcp.streamable_http_app()
-
-    # Add CORS so claude.ai browser can connect
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-        expose_headers=["*"],
-    )
-
-    # Wrap with host fix (outermost layer, runs first)
-    wrapped_app = HostFixMiddleware(app)
-
-    uvicorn.run(wrapped_app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port)
