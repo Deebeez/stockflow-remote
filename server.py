@@ -7,7 +7,14 @@ import numpy as np
 from mcp.server.fastmcp import FastMCP
 from starlette.middleware.cors import CORSMiddleware
 
-mcp = FastMCP("Stockflow")
+mcp = FastMCP(
+    "Stockflow",
+    stateless_http=True,
+    json_response=True,
+)
+
+# Disable DNS rebinding protection (required for Railway external access)
+mcp.settings.transport_security = None
 
 # ============================================================
 # TECHNICAL INDICATOR HELPERS
@@ -365,11 +372,12 @@ def get_options_chain(
 # APP SETUP
 # ============================================================
 
-# streamable_http_app() returns a complete Starlette app with:
-#   - /mcp route (Streamable HTTP endpoint)
-#   - lifespan handler (initializes session manager task group)
-# Do NOT wrap in another Starlette() or use Mount() — that breaks the lifespan.
-# Add CORS middleware directly to this app.
+# streamable_http_app() returns a complete Starlette app with /mcp route
+# and lifespan handler. Do NOT wrap in another Starlette or Mount.
+# Settings above enable:
+#   stateless_http=True  -> no session required (Claude.ai compatible)
+#   json_response=True   -> returns JSON not SSE streams
+#   transport_security=None -> allows external hosts (Railway)
 
 app = mcp.streamable_http_app()
 app.add_middleware(
